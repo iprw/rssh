@@ -61,11 +61,12 @@ jobs:
           - goos: windows
             goarch: "386"
             ext: .exe
-          # Android (linux + android-specific tags)
+          # Android
           - goos: android
             goarch: arm64
           - goos: android
             goarch: amd64
+            cgo: "1"
           # FreeBSD
           - goos: freebsd
             goarch: amd64
@@ -103,13 +104,14 @@ jobs:
 
       - name: Build
         env:
-          CGO_ENABLED: "0"
+          CGO_ENABLED: ${{ matrix.cgo || '0' }}
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           GOARM: ${{ matrix.goarm }}
           GOMIPS: ${{ matrix.gomips }}
         run: |
-          go build -trimpath -ldflags="-s -w" -o "${{ steps.name.outputs.artifact }}" ./cmd/rssh
+          VERSION="${GITHUB_REF_NAME:-dev}"
+          go build -trimpath -ldflags="-s -w -X main.Version=${VERSION}" -o "${{ steps.name.outputs.artifact }}" ./cmd/rssh
 
       - name: Compress with UPX
         run: |
@@ -155,7 +157,8 @@ jobs:
           GOOS: linux
           GOARCH: ${{ matrix.goarch }}
         run: |
-          go build -trimpath -ldflags="-s -w -linkmode external -extldflags '-static'" \
+          VERSION="${GITHUB_REF_NAME:-dev}"
+          go build -trimpath -ldflags="-s -w -linkmode external -extldflags '-static' -X main.Version=${VERSION}" \
             -o "rssh-linux-${{ matrix.goarch }}-musl" ./cmd/rssh
 
       - name: Compress with UPX

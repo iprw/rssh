@@ -2,6 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -12,6 +15,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -23,6 +27,9 @@ import (
 	"github.com/iprw/rssh/internal/relay"
 	"github.com/iprw/rssh/internal/tlsutil"
 )
+
+// Version is set at build time via -ldflags="-X main.Version=v0.1.0".
+var Version = "dev"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -38,6 +45,13 @@ func main() {
 		cmd.Stderr = os.Stderr
 		cmd.Run()
 		os.Exit(0)
+	case "version", "--version", "-V":
+		fmt.Printf("rssh %s (%s/%s)\n", Version, runtime.GOOS, runtime.GOARCH)
+	case "update":
+		if err := selfUpdate(); err != nil {
+			fmt.Fprintf(os.Stderr, "[rssh] update failed: %v\n", err)
+			os.Exit(1)
+		}
 	case "proxy":
 		runProxy(os.Args[2:])
 	case "relay":
@@ -50,13 +64,12 @@ func main() {
 }
 
 func printUsage() {
-	fmt.Fprintf(os.Stderr, `rssh — resilient SSH with transparent reconnection
+	fmt.Fprintf(os.Stderr, `rssh %s — resilient SSH with transparent reconnection
 
 usage:
   rssh [flags] [user@]host [command]    connect via tunnelled SSH
-  rssh proxy [flags] <url>              run as ProxyCommand (internal)
-  rssh relay [flags]                    run as relay server (internal)
-  rssh connect --proxy <addr> <h> <p>  SOCKS5 connector (internal)
+  rssh update                           self-update to latest release
+  rssh version                          print version
 
 flags:
   -v            verbose output (rssh only)
@@ -68,9 +81,12 @@ flags:
   --tor         route through Tor (SOCKS5)
   --tor-proxy   Tor SOCKS5 address (default 127.0.0.1:9050)
 
+install:
+  curl -fsSL https://raw.githubusercontent.com/iprw/rssh/main/install.sh | sh
+
 By default, HTTP/3 (QUIC) and HTTP/2 are raced in parallel automatically.
 All other flags (e.g. -p, -i, -L, -D) are passed through to ssh.
-`)
+`, Version)
 }
 
 func runProxy(args []string) {
@@ -250,8 +266,152 @@ func runConnect(args []string) {
 }
 
 func runCLI(args []string) {
+	// Background update check — non-blocking, best-effort.
+	if Version != "dev" {
+		go checkForUpdate()
+	}
+
 	if err := bootstrap.Run(args); err != nil {
 		fmt.Fprintf(os.Stderr, "[rssh] %v\n", err)
 		os.Exit(1)
 	}
+}
+
+const (
+	githubRepo       = "iprw/rssh"
+	latestReleaseAPI = "https://api.github.com/repos/" + githubRepo + "/releases/latest"
+	latestDownload   = "https://github.com/" + githubRepo + "/releases/latest/download"
+)
+
+// checkForUpdate prints a one-line notice if a newer release exists.
+func checkForUpdate() {
+	client := &http.Client{Timeout: 3 * time.Second}
+	req, _ := http.NewRequest("GET", latestReleaseAPI, nil)
+	req.Header.Set("Accept", "application/vnd.github+json")
+
+	resp, err := client.Do(req)
+	if err != nil || resp.StatusCode != 200 {
+		return
+	}
+	defer resp.Body.Close()
+
+	var release struct {
+		TagName string `json:"tag_name"`
+	}
+	if json.NewDecoder(resp.Body).Decode(&release) != nil {
+		return
+	}
+
+	remote := strings.TrimPrefix(release.TagName, "v")
+	local := strings.TrimPrefix(Version, "v")
+	if remote != "" && remote != local {
+		fmt.Fprintf(os.Stderr, "[rssh] update available: %s -> %s (run: rssh update)\n", Version, release.TagName)
+	}
+}
+
+// selfUpdate downloads the latest release binary and replaces the current executable.
+func selfUpdate() error {
+	fmt.Fprintf(os.Stderr, "[rssh] checking for updates...\n")
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	req, _ := http.NewRequest("GET", latestReleaseAPI, nil)
+	req.Header.Set("Accept", "application/vnd.github+json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("check latest release: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("GitHub API: HTTP %d", resp.StatusCode)
+	}
+
+	var release struct {
+		TagName string `json:"tag_name"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
+		return fmt.Errorf("parse release: %w", err)
+	}
+
+	remote := strings.TrimPrefix(release.TagName, "v")
+	local := strings.TrimPrefix(Version, "v")
+	if remote == local {
+		fmt.Fprintf(os.Stderr, "[rssh] already up to date (%s)\n", Version)
+		return nil
+	}
+
+	// Check if the binary actually differs by comparing checksums.
+	self, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("find self: %w", err)
+	}
+	selfHash, _ := fileHash(self)
+
+	binaryName := fmt.Sprintf("rssh-%s-%s", runtime.GOOS, runtime.GOARCH)
+	url := latestDownload + "/" + binaryName
+
+	fmt.Fprintf(os.Stderr, "[rssh] downloading %s (%s)...\n", release.TagName, binaryName)
+
+	dlResp, err := http.Get(url)
+	if err != nil {
+		return fmt.Errorf("download: %w", err)
+	}
+	defer dlResp.Body.Close()
+
+	if dlResp.StatusCode != 200 {
+		return fmt.Errorf("download %s: HTTP %d", binaryName, dlResp.StatusCode)
+	}
+
+	// Write to temp file next to the executable for atomic rename.
+	dir := filepath.Dir(self)
+	tmp, err := os.CreateTemp(dir, ".rssh-update-*")
+	if err != nil {
+		// Fall back to system temp if exe dir isn't writable.
+		tmp, err = os.CreateTemp("", ".rssh-update-*")
+		if err != nil {
+			return fmt.Errorf("create temp: %w", err)
+		}
+	}
+	tmpPath := tmp.Name()
+
+	h := sha256.New()
+	if _, err := io.Copy(tmp, io.TeeReader(dlResp.Body, h)); err != nil {
+		tmp.Close()
+		os.Remove(tmpPath)
+		return fmt.Errorf("write update: %w", err)
+	}
+	tmp.Close()
+
+	newHash := hex.EncodeToString(h.Sum(nil))
+	if selfHash == newHash {
+		os.Remove(tmpPath)
+		fmt.Fprintf(os.Stderr, "[rssh] binary unchanged (same checksum), skipping\n")
+		return nil
+	}
+
+	if err := os.Chmod(tmpPath, 0755); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("chmod: %w", err)
+	}
+
+	if err := os.Rename(tmpPath, self); err != nil {
+		// Cross-device rename — copy instead.
+		os.Remove(tmpPath)
+		return fmt.Errorf("replace binary: %w (try: sudo rssh update)", err)
+	}
+
+	fmt.Fprintf(os.Stderr, "[rssh] updated %s -> %s\n", Version, release.TagName)
+	return nil
+}
+
+func fileHash(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	io.Copy(h, f)
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
