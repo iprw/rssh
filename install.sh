@@ -12,20 +12,20 @@ main() {
     ARCH=$(uname -m)
 
     case "$ARCH" in
-        x86_64)       ARCH="amd64" ;;
+        x86_64)        ARCH="amd64" ;;
         aarch64|arm64) ARCH="arm64" ;;
-        armv7l)       ARCH="armv7" ;;
-        armv6l)       ARCH="armv6" ;;
-        i386|i686)    ARCH="386" ;;
-        riscv64)      ARCH="riscv64" ;;
-        mips)         ARCH="mips" ;;
-        mipsel)       ARCH="mipsle" ;;
-        mips64)       ARCH="mips64" ;;
-        mips64el)     ARCH="mips64le" ;;
-        ppc64le)      ARCH="ppc64le" ;;
-        s390x)        ARCH="s390x" ;;
-        loongarch64)  ARCH="loong64" ;;
-        *)            echo "unsupported architecture: $ARCH" >&2; exit 1 ;;
+        armv7l)        ARCH="armv7" ;;
+        armv6l)        ARCH="armv6" ;;
+        i386|i686)     ARCH="386" ;;
+        riscv64)       ARCH="riscv64" ;;
+        mips)          ARCH="mips" ;;
+        mipsel)        ARCH="mipsle" ;;
+        mips64)        ARCH="mips64" ;;
+        mips64el)      ARCH="mips64le" ;;
+        ppc64le)       ARCH="ppc64le" ;;
+        s390x)         ARCH="s390x" ;;
+        loongarch64)   ARCH="loong64" ;;
+        *)             echo "unsupported architecture: $ARCH" >&2; exit 1 ;;
     esac
 
     case "$OS" in
@@ -35,20 +35,47 @@ main() {
     esac
 
     BINARY="rssh-${OS}-${ARCH}"
-    URL="https://github.com/${REPO}/releases/latest/download/${BINARY}"
+    BASE_URL="https://github.com/${REPO}/releases/latest/download"
+    URL="${BASE_URL}/${BINARY}"
+    CHECKSUMS_URL="${BASE_URL}/checksums.txt"
 
     echo "=> downloading ${BINARY}..."
 
     TMP=$(mktemp)
-    trap 'rm -f "$TMP"' EXIT
+    trap 'rm -f "$TMP" "${TMP}.checksums"' EXIT
 
     if command -v curl >/dev/null 2>&1; then
         curl -fsSL -o "$TMP" "$URL"
+        curl -fsSL -o "${TMP}.checksums" "$CHECKSUMS_URL" 2>/dev/null || true
     elif command -v wget >/dev/null 2>&1; then
         wget -qO "$TMP" "$URL"
+        wget -qO "${TMP}.checksums" "$CHECKSUMS_URL" 2>/dev/null || true
     else
         echo "error: curl or wget required" >&2
         exit 1
+    fi
+
+    # Verify checksum if checksums.txt was downloaded and sha256sum is available.
+    if [ -s "${TMP}.checksums" ] && command -v sha256sum >/dev/null 2>&1; then
+        EXPECTED=$(grep "  ${BINARY}\$" "${TMP}.checksums" | awk '{print $1}')
+        if [ -n "$EXPECTED" ]; then
+            ACTUAL=$(sha256sum "$TMP" | awk '{print $1}')
+            if [ "$EXPECTED" != "$ACTUAL" ]; then
+                echo "error: checksum mismatch (expected ${EXPECTED}, got ${ACTUAL})" >&2
+                exit 1
+            fi
+            echo "=> checksum verified"
+        fi
+    elif [ -s "${TMP}.checksums" ] && command -v shasum >/dev/null 2>&1; then
+        EXPECTED=$(grep "  ${BINARY}\$" "${TMP}.checksums" | awk '{print $1}')
+        if [ -n "$EXPECTED" ]; then
+            ACTUAL=$(shasum -a 256 "$TMP" | awk '{print $1}')
+            if [ "$EXPECTED" != "$ACTUAL" ]; then
+                echo "error: checksum mismatch (expected ${EXPECTED}, got ${ACTUAL})" >&2
+                exit 1
+            fi
+            echo "=> checksum verified"
+        fi
     fi
 
     chmod +x "$TMP"
