@@ -9,178 +9,24 @@ permissions:
   contents: write
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # Linux — amd64/arm64/arm/386/mips/riscv
-          - goos: linux
-            goarch: amd64
-          - goos: linux
-            goarch: arm64
-          - goos: linux
-            goarch: arm
-            goarm: "7"
-          - goos: linux
-            goarch: arm
-            goarm: "6"
-          - goos: linux
-            goarch: "386"
-          - goos: linux
-            goarch: mips64
-          - goos: linux
-            goarch: mips64le
-          - goos: linux
-            goarch: mips
-            gomips: softfloat
-          - goos: linux
-            goarch: mipsle
-            gomips: softfloat
-          - goos: linux
-            goarch: riscv64
-          - goos: linux
-            goarch: ppc64le
-          - goos: linux
-            goarch: s390x
-          - goos: linux
-            goarch: loong64
-          # macOS
-          - goos: darwin
-            goarch: amd64
-          - goos: darwin
-            goarch: arm64
-          # Windows
-          - goos: windows
-            goarch: amd64
-            ext: .exe
-          - goos: windows
-            goarch: arm64
-            ext: .exe
-          - goos: windows
-            goarch: "386"
-            ext: .exe
-          # Android
-          - goos: android
-            goarch: arm64
-          - goos: android
-            goarch: amd64
-            cgo: "1"
-          # FreeBSD
-          - goos: freebsd
-            goarch: amd64
-          - goos: freebsd
-            goarch: arm64
-          - goos: freebsd
-            goarch: arm
-            goarm: "7"
-          # OpenBSD / NetBSD
-          - goos: openbsd
-            goarch: amd64
-          - goos: openbsd
-            goarch: arm64
-          - goos: netbsd
-            goarch: amd64
-          - goos: netbsd
-            goarch: arm64
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version: "1.26"
-
-      - name: Build artifact name
-        id: name
-        run: |
-          NAME="rssh-${{ matrix.goos }}-${{ matrix.goarch }}"
-          if [ -n "${{ matrix.goarm }}" ]; then
-            NAME="${NAME}v${{ matrix.goarm }}"
-          fi
-          NAME="${NAME}${{ matrix.ext }}"
-          echo "artifact=${NAME}" >> "$GITHUB_OUTPUT"
-
-      - name: Build
-        env:
-          CGO_ENABLED: ${{ matrix.cgo || '0' }}
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-          GOARM: ${{ matrix.goarm }}
-          GOMIPS: ${{ matrix.gomips }}
-        run: |
-          VERSION="${GITHUB_REF_NAME:-dev}"
-          go build -trimpath -ldflags="-s -w -X main.Version=${VERSION}" -o "${{ steps.name.outputs.artifact }}" ./cmd/rssh
-
-      - name: Compress with UPX
-        run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq upx-ucl > /dev/null 2>&1
-          upx --best --lzma "${{ steps.name.outputs.artifact }}" || echo "UPX skipped for ${{ steps.name.outputs.artifact }}"
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ${{ steps.name.outputs.artifact }}
-          path: ${{ steps.name.outputs.artifact }}
-
-  build-musl:
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - goarch: amd64
-            musl_arch: x86_64
-          - goarch: arm64
-            musl_arch: aarch64
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version: "1.26"
-
-      - name: Install musl cross-compiler
-        run: |
-          sudo apt-get update -qq
-          if [ "${{ matrix.musl_arch }}" = "x86_64" ]; then
-            sudo apt-get install -y -qq musl-tools > /dev/null 2>&1
-            echo "CC=musl-gcc" >> "$GITHUB_ENV"
-          else
-            curl -sL "https://musl.cc/${{ matrix.musl_arch }}-linux-musl-cross.tgz" | sudo tar xz -C /opt
-            echo "CC=/opt/${{ matrix.musl_arch }}-linux-musl-cross/bin/${{ matrix.musl_arch }}-linux-musl-gcc" >> "$GITHUB_ENV"
-          fi
-
-      - name: Build with musl
-        env:
-          CGO_ENABLED: "1"
-          GOOS: linux
-          GOARCH: ${{ matrix.goarch }}
-        run: |
-          VERSION="${GITHUB_REF_NAME:-dev}"
-          go build -trimpath -ldflags="-s -w -linkmode external -extldflags '-static' -X main.Version=${VERSION}" \
-            -o "rssh-linux-${{ matrix.goarch }}-musl" ./cmd/rssh
-
-      - name: Compress with UPX
-        run: |
-          sudo apt-get install -y -qq upx-ucl > /dev/null 2>&1
-          upx --best --lzma "rssh-linux-${{ matrix.goarch }}-musl" || echo "UPX skipped"
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: rssh-linux-${{ matrix.goarch }}-musl
-          path: rssh-linux-${{ matrix.goarch }}-musl
-
   release:
-    needs: [build, build-musl]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v4
         with:
-          merge-multiple: true
+          fetch-depth: 0
 
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
+      - uses: actions/setup-go@v5
         with:
-          generate_release_notes: true
-          files: rssh-*
+          go-version: "1.26"
+
+      - name: Install UPX
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq upx-ucl > /dev/null 2>&1
+
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
