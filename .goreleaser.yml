@@ -47,6 +47,8 @@ builds:
       - goos: android
         goarch: arm
       - goos: android
+        goarch: amd64
+      - goos: android
         goarch: "386"
     hooks:
       post:
