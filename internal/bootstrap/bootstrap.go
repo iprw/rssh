@@ -56,31 +56,25 @@ func Run(args []string) error {
 		destination string
 		sshArgs     []string // SSH flags (go before destination)
 		remoteCmd   []string // remote command (goes after destination)
-		noTLS       bool
-		useTor      bool
 		verbose     bool
-		torProxy    string
+		proxyAddr   string // SOCKS5 proxy (host:port)
 		password    string
 		forceProto  string // "h2" or "h3"
 		vCount      int    // number of -v flags seen
 	)
 
-	torProxy = "127.0.0.1:9050"
-
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
-		case "--no-tls":
-			noTLS = true
-		case "--tor":
-			useTor = true
-		case "--verbose":
-			verbose = true
-		case "--tor-proxy":
+		case "-t":
+			proxyAddr = "127.0.0.1:9050"
+		case "--proxy":
 			if i+1 < len(args) {
 				i++
-				torProxy = args[i]
+				proxyAddr = parseProxyAddr(args[i])
 			}
-		case "--pass":
+		case "--verbose":
+			verbose = true
+		case "--password":
 			if i+1 < len(args) {
 				i++
 				password = args[i]
@@ -117,7 +111,7 @@ func Run(args []string) error {
 	}
 
 	if destination == "" {
-		return fmt.Errorf("usage: rssh [--no-tls] [--tor] [-v] [ssh-flags] [user@]host [command]")
+		return fmt.Errorf("usage: rssh [-t] [--proxy addr] [--password pw] [-v] [ssh-flags] [user@]host [command]")
 	}
 
 	// vlogf prints only when verbose is enabled.
@@ -129,7 +123,7 @@ func Run(args []string) error {
 
 	_, host := ParseDestination(destination)
 
-	vlogf("destination=%s host=%s noTLS=%v tor=%v", destination, host, noTLS, useTor)
+	vlogf("destination=%s host=%s proxy=%s", destination, host, proxyAddr)
 	if len(sshArgs) > 0 {
 		vlogf("ssh flags: %v", sshArgs)
 	}
@@ -144,7 +138,7 @@ func Run(args []string) error {
 	}
 
 	// Password handling:
-	//   --pass flag: use directly, bypass key auth
+	//   --password flag: use directly, bypass key auth
 	//   No --pass:   install a recording askpass so SSH tries keys first;
 	//                only if keys fail does it prompt for a password (via
 	//                /dev/tty), which is cached for the tunneled connection.
@@ -182,7 +176,7 @@ func Run(args []string) error {
 
 	// Bootstrap: SSH in, deploy relay if needed, start relay
 	vlogf("bootstrapping relay on %s...", host)
-	port, err := bootstrapRelay(destination, host, tok, noTLS, useTor, torProxy, bootstrapArgs)
+	port, err := bootstrapRelay(destination, host, tok, proxyAddr, bootstrapArgs)
 	if err != nil {
 		vlogf("bootstrap failed: %v", err)
 		fmt.Fprintf(os.Stderr, "[rssh] tunnel unavailable, using plain ssh (no reconnection protection)\n")
@@ -192,8 +186,8 @@ func Run(args []string) error {
 			os.Unsetenv("RSSH_PASS_FILE")
 		}
 		var fallback []string
-		if useTor {
-			fallback = append(fallback, "-o", fmt.Sprintf("ProxyCommand=%s connect --proxy %s %%h %%p", selfPath(), torProxy))
+		if proxyAddr != "" {
+			fallback = append(fallback, "-o", fmt.Sprintf("ProxyCommand=%s connect --proxy %s %%h %%p", selfPath(), proxyAddr))
 		}
 		fallback = append(fallback, sshArgs...)
 		fallback = append(fallback, destination)
@@ -216,12 +210,8 @@ func Run(args []string) error {
 		os.Unsetenv("RSSH_PASS_FILE")
 	}
 
-	// Build relay URL
-	scheme := "https"
-	if noTLS {
-		scheme = "http"
-	}
-	connectURL := fmt.Sprintf("%s://%s:%s/connect?token=%s", scheme, host, port, tok)
+	// Build relay URL (always TLS)
+	connectURL := fmt.Sprintf("https://%s:%s/connect?token=%s", host, port, tok)
 
 	// Build ProxyCommand
 	self, err := os.Executable()
@@ -232,11 +222,8 @@ func Run(args []string) error {
 	// Build proxy command: flags MUST come before the URL (positional arg)
 	// because Go's flag package stops parsing after the first non-flag.
 	proxyArgs := fmt.Sprintf("%s proxy", self)
-	if noTLS {
-		proxyArgs += " --no-tls"
-	}
-	if useTor {
-		proxyArgs += fmt.Sprintf(" --tor-proxy %s", torProxy)
+	if proxyAddr != "" {
+		proxyArgs += fmt.Sprintf(" --proxy %s", proxyAddr)
 	}
 	if verbose {
 		proxyArgs += " --verbose"
@@ -258,7 +245,7 @@ func Run(args []string) error {
 	return execSSH(fullArgs)
 }
 
-func bootstrapRelay(destination, host, tok string, noTLS, useTor bool, torProxy string, sshArgs []string) (string, error) {
+func bootstrapRelay(destination, host, tok string, proxyAddr string, sshArgs []string) (string, error) {
 	// Build --sshd from the caller's destination host and -p port.
 	// Don't assume localhost — connect to exactly what was requested.
 	sshdPort := "22"
@@ -277,16 +264,12 @@ func bootstrapRelay(destination, host, tok string, noTLS, useTor bool, torProxy 
 			"~/.rssh/relay relay --token %s --listen :0 --sshd %s",
 		tok, sshdAddr,
 	)
-	if noTLS {
-		relayCmd += " --no-tls"
-	}
-
 	// Forward SSH connection flags (e.g. -p, -i, -F, -J) so the
 	// bootstrap connection reaches the same host as the final session.
 	sshBootstrap := append([]string{}, sshArgs...)
-	if useTor {
+	if proxyAddr != "" {
 		sshBootstrap = append(sshBootstrap,
-			"-o", fmt.Sprintf("ProxyCommand=%s connect --proxy %s %%h %%p", selfPath(), torProxy),
+			"-o", fmt.Sprintf("ProxyCommand=%s connect --proxy %s %%h %%p", selfPath(), proxyAddr),
 		)
 	}
 	sshBootstrap = append(sshBootstrap, destination, relayCmd)
@@ -311,10 +294,10 @@ func bootstrapRelay(destination, host, tok string, noTLS, useTor bool, torProxy 
 			// Remote already exited (exit 0). Don't SIGKILL — that
 			// destroys the ControlMaster socket and breaks SCP auth.
 			cmd.Wait()
-			if err := deployRelay(destination, useTor, torProxy, sshArgs); err != nil {
+			if err := deployRelay(destination, proxyAddr, sshArgs); err != nil {
 				return "", fmt.Errorf("deploy: %w", err)
 			}
-			return bootstrapRelay(destination, host, tok, noTLS, useTor, torProxy, sshArgs)
+			return bootstrapRelay(destination, host, tok, proxyAddr, sshArgs)
 		}
 
 		// Auto-update: compare remote relay hash with local binary.
@@ -324,10 +307,10 @@ func bootstrapRelay(destination, host, tok string, noTLS, useTor bool, torProxy 
 				fmt.Fprintf(os.Stderr, "[rssh] relay outdated, updating...\n")
 				cmd.Process.Signal(syscall.SIGTERM)
 				cmd.Wait()
-				if err := deployRelay(destination, useTor, torProxy, sshArgs); err != nil {
+				if err := deployRelay(destination, proxyAddr, sshArgs); err != nil {
 					return "", fmt.Errorf("deploy: %w", err)
 				}
-				return bootstrapRelay(destination, host, tok, noTLS, useTor, torProxy, sshArgs)
+				return bootstrapRelay(destination, host, tok, proxyAddr, sshArgs)
 			}
 			continue
 		}
@@ -343,13 +326,13 @@ func bootstrapRelay(destination, host, tok string, noTLS, useTor bool, torProxy 
 	return "", fmt.Errorf("relay did not report port (ssh exit: %v, scanner err: %v)", waitErr, scanner.Err())
 }
 
-func deployRelay(destination string, useTor bool, torProxy string, extraSSHArgs []string) error {
+func deployRelay(destination string, proxyAddr string, extraSSHArgs []string) error {
 	// Determine remote OS/arch — forward connection flags so scp/ssh
 	// reach the same host (e.g. -p, -i, -F, -J).
 	sshArgs := append([]string{}, extraSSHArgs...)
-	if useTor {
+	if proxyAddr != "" {
 		sshArgs = append(sshArgs,
-			"-o", fmt.Sprintf("ProxyCommand=%s connect --proxy %s %%h %%p", selfPath(), torProxy),
+			"-o", fmt.Sprintf("ProxyCommand=%s connect --proxy %s %%h %%p", selfPath(), proxyAddr),
 		)
 	}
 	sshArgs = append(sshArgs, destination,
@@ -382,9 +365,9 @@ func deployRelay(destination string, useTor bool, torProxy string, extraSSHArgs 
 	fmt.Fprintf(os.Stderr, "[rssh] deploying relay to %s (%s/%s)...\n", destination, goos, goarch)
 
 	deployArgs := append([]string{}, extraSSHArgs...)
-	if useTor {
+	if proxyAddr != "" {
 		deployArgs = append(deployArgs,
-			"-o", fmt.Sprintf("ProxyCommand=%s connect --proxy %s %%h %%p", selfPath(), torProxy),
+			"-o", fmt.Sprintf("ProxyCommand=%s connect --proxy %s %%h %%p", selfPath(), proxyAddr),
 		)
 	}
 	deployArgs = append(deployArgs, "-C", destination,
@@ -590,6 +573,17 @@ func normalizeArch(uname string) string {
 	default:
 		return uname
 	}
+}
+
+// parseProxyAddr extracts a host:port from a proxy address that may be
+// a bare host:port or a URL like socks5h://127.0.0.1:9050.
+func parseProxyAddr(addr string) string {
+	for _, prefix := range []string{"socks5h://", "socks5://", "socks://", "socks4://"} {
+		if strings.HasPrefix(addr, prefix) {
+			return strings.TrimPrefix(addr, prefix)
+		}
+	}
+	return addr
 }
 
 // normalizeOS maps uname -s output to Go GOOS values.

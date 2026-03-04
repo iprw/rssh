@@ -189,7 +189,7 @@ func TestFallbackPlainSSHPath(t *testing.T) {
 	addr := ln.Addr().String()
 	ln.Close() // port now refuses new connections
 
-	_, bootstrapErr := bootstrapRelay(addr, "127.0.0.1", "tok", false, false, "127.0.0.1:9050", nil)
+	_, bootstrapErr := bootstrapRelay(addr, "127.0.0.1", "tok", "", nil)
 	if bootstrapErr == nil {
 		t.Fatal("expected error from bootstrapRelay with refused destination")
 	}

@@ -34,12 +34,11 @@ rssh user@host uptime              # remote commands work
 ### Options
 
 ```
---pass <pw>     SSH password (skips interactive prompt)
+--password <pw> SSH password (skips interactive prompt)
 --h2            force HTTP/2 only
 --h3            force HTTP/3 (QUIC) only
---tor           route through Tor
---tor-proxy     SOCKS5 address (default 127.0.0.1:9050)
---no-tls        disable TLS
+-t              route through Tor (socks5h://127.0.0.1:9050)
+--proxy <addr>  SOCKS5 proxy address (e.g. 127.0.0.1:1080)
 -v              verbose (rssh only)
 -vv             verbose (rssh + ssh)
 ```

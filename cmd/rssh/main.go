@@ -72,14 +72,13 @@ usage:
   rssh version                          print version
 
 flags:
-  -v            verbose output (rssh only)
-  -vv           verbose output (rssh + ssh)
-  --pass <pw>   SSH password (avoids interactive prompt)
-  --no-tls      disable TLS (use http instead of https)
-  --h2          force HTTP/2 only (skip QUIC)
-  --h3          force HTTP/3 (QUIC) only (skip HTTP/2)
-  --tor         route through Tor (SOCKS5)
-  --tor-proxy   Tor SOCKS5 address (default 127.0.0.1:9050)
+  -v              verbose output (rssh only)
+  -vv             verbose output (rssh + ssh)
+  --password <pw> SSH password (avoids interactive prompt)
+  --h2            force HTTP/2 only (skip QUIC)
+  --h3            force HTTP/3 (QUIC) only (skip HTTP/2)
+  -t              route through Tor (socks5h://127.0.0.1:9050)
+  --proxy <addr>  SOCKS5 proxy address (e.g. 127.0.0.1:1080)
 
 install:
   curl -fsSL https://raw.githubusercontent.com/iprw/rssh/main/install.sh | sh
@@ -91,8 +90,7 @@ All other flags (e.g. -p, -i, -L, -D) are passed through to ssh.
 
 func runProxy(args []string) {
 	fs := flag.NewFlagSet("proxy", flag.ExitOnError)
-	noTLS := fs.Bool("no-tls", false, "disable TLS (use http:// instead of https://)")
-	torProxy := fs.String("tor-proxy", "", "SOCKS5 proxy address for Tor routing (e.g. 127.0.0.1:9050)")
+	proxyAddr := fs.String("proxy", "", "SOCKS5 proxy address (e.g. 127.0.0.1:9050)")
 	verbose := fs.Bool("verbose", false, "enable verbose debug output")
 	forceH2 := fs.Bool("h2", false, "force HTTP/2 only (skip H3/QUIC)")
 	forceH3 := fs.Bool("h3", false, "force HTTP/3 (QUIC) only (skip H2)")
@@ -110,14 +108,11 @@ func runProxy(args []string) {
 	cfg := proxy.Config{
 		URL:      wsURL,
 		InputURL: inputURL,
+		TLSConfig: tlsutil.ClientTLSConfig(),
 	}
 
-	if !*noTLS {
-		cfg.TLSConfig = tlsutil.ClientTLSConfig()
-	}
-
-	if *torProxy != "" {
-		cfg.SOCKSAddr = *torProxy
+	if *proxyAddr != "" {
+		cfg.SOCKSAddr = *proxyAddr
 	}
 
 	cfg.Verbose = *verbose
