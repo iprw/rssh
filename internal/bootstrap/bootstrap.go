@@ -6,13 +6,20 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 
 	"github.com/iprw/rssh/internal/token"
 )
+
+// releaseURL is the base URL for downloading pre-built binaries.
+// It can be overridden in tests.
+var releaseURL = "https://github.com/iprw/rssh/releases/latest/download"
 
 // ParseDestination splits "user@host" into user and host parts.
 func ParseDestination(dest string) (user, host string) {
@@ -358,13 +365,16 @@ func deployRelay(destination string, useTor bool, torProxy string, extraSSHArgs 
 		return fmt.Errorf("unexpected uname output: %q", string(out))
 	}
 
-	goos := strings.ToLower(parts[0])
+	goos := normalizeOS(parts[0])
 	goarch := normalizeArch(parts[1])
 
-	// Find local relay binary for this target
-	self, err := os.Executable()
+	// Find the correct binary for the remote target.
+	binPath, cleanup, err := findRelayBinary(goos, goarch)
 	if err != nil {
-		return fmt.Errorf("find self: %w", err)
+		return fmt.Errorf("find relay binary for %s/%s: %w", goos, goarch, err)
+	}
+	if cleanup != nil {
+		defer cleanup()
 	}
 
 	// Deploy relay binary by piping through the ControlMaster SSH session.
@@ -383,38 +393,146 @@ func deployRelay(destination string, useTor bool, torProxy string, extraSSHArgs 
 	sshCmd := exec.Command("ssh", deployArgs...)
 	sshCmd.Stderr = os.Stderr
 
-	// Use pv for progress bar if available, otherwise pipe directly.
-	if pvPath, _ := exec.LookPath("pv"); pvPath != "" {
-		pvCmd := exec.Command(pvPath, self)
-		pvCmd.Stderr = os.Stderr
-		sshCmd.Stdin, err = pvCmd.StdoutPipe()
-		if err != nil {
-			return fmt.Errorf("pv pipe: %w", err)
-		}
-		if err := pvCmd.Start(); err != nil {
-			return fmt.Errorf("pv start: %w", err)
-		}
-		if err := sshCmd.Run(); err != nil {
-			pvCmd.Process.Kill()
-			pvCmd.Wait()
-			return fmt.Errorf("deploy relay: %w", err)
-		}
-		if err := pvCmd.Wait(); err != nil {
-			return fmt.Errorf("pv: %w", err)
-		}
-	} else {
-		binFile, err := os.Open(self)
-		if err != nil {
-			return fmt.Errorf("open self: %w", err)
-		}
-		defer binFile.Close()
-		sshCmd.Stdin = binFile
-		if err := sshCmd.Run(); err != nil {
-			return fmt.Errorf("deploy relay: %w", err)
-		}
+	binFile, err := os.Open(binPath)
+	if err != nil {
+		return fmt.Errorf("open binary: %w", err)
+	}
+	defer binFile.Close()
+
+	info, err := binFile.Stat()
+	if err != nil {
+		return fmt.Errorf("stat binary: %w", err)
+	}
+
+	sshCmd.Stdin = &progressReader{r: binFile, total: info.Size()}
+	if err := sshCmd.Run(); err != nil {
+		return fmt.Errorf("deploy relay: %w", err)
 	}
 
 	return nil
+}
+
+// findRelayBinary locates or downloads a relay binary for the given OS/arch.
+// Returns the path to the binary and an optional cleanup function for temp files.
+//
+// Resolution order:
+//  1. Same-arch fast path: if local OS/arch matches, use the running executable.
+//  2. Local lookup: search for rssh-{goos}-{goarch} next to the executable,
+//     in ./dist/, or in ~/.rssh/bin/.
+//  3. GitHub download: fetch from the latest release, cache in ~/.rssh/bin/.
+//  4. Error with manual instructions.
+func findRelayBinary(goos, goarch string) (path string, cleanup func(), err error) {
+	// 1. Same-arch fast path — deploy the running binary.
+	if goos == runtime.GOOS && goarch == runtime.GOARCH {
+		self, err := os.Executable()
+		if err != nil {
+			return "", nil, fmt.Errorf("find self: %w", err)
+		}
+		return self, nil, nil
+	}
+
+	binaryName := fmt.Sprintf("rssh-%s-%s", goos, goarch)
+
+	// For ARM targets, also try variant-specific names (e.g. rssh-linux-armv7).
+	var altNames []string
+	if goarch == "arm" {
+		altNames = append(altNames, fmt.Sprintf("rssh-%s-armv7", goos))
+		altNames = append(altNames, fmt.Sprintf("rssh-%s-armv6", goos))
+	}
+	// Also try musl variant.
+	altNames = append(altNames, binaryName+"-musl")
+
+	candidates := append([]string{binaryName}, altNames...)
+
+	// 2. Local lookup — check common locations.
+	self, _ := os.Executable()
+	var searchDirs []string
+	if self != "" {
+		searchDirs = append(searchDirs, filepath.Dir(self))
+	}
+	searchDirs = append(searchDirs, "dist")
+	if home, err := os.UserHomeDir(); err == nil {
+		searchDirs = append(searchDirs, filepath.Join(home, ".rssh", "bin"))
+	}
+
+	for _, dir := range searchDirs {
+		for _, name := range candidates {
+			candidate := filepath.Join(dir, name)
+			if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+				fmt.Fprintf(os.Stderr, "[rssh] using local binary: %s\n", candidate)
+				return candidate, nil, nil
+			}
+		}
+	}
+
+	// 3. Download from GitHub releases.
+	fmt.Fprintf(os.Stderr, "[rssh] downloading %s from GitHub releases...\n", binaryName)
+	downloadedPath, err := downloadRelayBinary(binaryName)
+	if err != nil {
+		return "", nil, fmt.Errorf(
+			"no %s binary found locally and download failed: %w\n\n"+
+				"To fix, either:\n"+
+				"  1. Place the binary at ~/.rssh/bin/%s\n"+
+				"  2. Build it: GOOS=%s GOARCH=%s go build -o ~/.rssh/bin/%s -trimpath -ldflags=\"-s -w\" ./cmd/rssh\n"+
+				"  3. Ensure internet access for automatic download from GitHub releases",
+			binaryName, err, binaryName, goos, goarch, binaryName,
+		)
+	}
+
+	return downloadedPath, nil, nil
+}
+
+// downloadRelayBinary fetches a pre-built binary from GitHub releases and
+// caches it in ~/.rssh/bin/ for future use.
+func downloadRelayBinary(binaryName string) (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("home dir: %w", err)
+	}
+
+	cacheDir := filepath.Join(home, ".rssh", "bin")
+	if err := os.MkdirAll(cacheDir, 0755); err != nil {
+		return "", fmt.Errorf("create cache dir: %w", err)
+	}
+
+	url := releaseURL + "/" + binaryName
+
+	resp, err := http.Get(url)
+	if err != nil {
+		return "", fmt.Errorf("download %s: %w", url, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("download %s: HTTP %d", url, resp.StatusCode)
+	}
+
+	// Write to a temp file then atomically rename to avoid partial downloads.
+	tmpFile, err := os.CreateTemp(cacheDir, binaryName+".tmp.*")
+	if err != nil {
+		return "", fmt.Errorf("create temp file: %w", err)
+	}
+	tmpPath := tmpFile.Name()
+
+	if _, err := io.Copy(tmpFile, resp.Body); err != nil {
+		tmpFile.Close()
+		os.Remove(tmpPath)
+		return "", fmt.Errorf("write binary: %w", err)
+	}
+	tmpFile.Close()
+
+	destPath := filepath.Join(cacheDir, binaryName)
+	if err := os.Chmod(tmpPath, 0755); err != nil {
+		os.Remove(tmpPath)
+		return "", fmt.Errorf("chmod: %w", err)
+	}
+	if err := os.Rename(tmpPath, destPath); err != nil {
+		os.Remove(tmpPath)
+		return "", fmt.Errorf("rename: %w", err)
+	}
+
+	fmt.Fprintf(os.Stderr, "[rssh] cached binary at %s\n", destPath)
+	return destPath, nil
 }
 
 // localBinaryHash returns the SHA256 hex digest of the running executable.
@@ -449,8 +567,47 @@ func normalizeArch(uname string) string {
 		return "amd64"
 	case "aarch64", "arm64":
 		return "arm64"
+	case "i386", "i486", "i586", "i686":
+		return "386"
+	case "armv7l", "armv6l":
+		return "arm"
+	case "mips":
+		return "mips"
+	case "mipsel":
+		return "mipsle"
+	case "mips64":
+		return "mips64"
+	case "mips64el":
+		return "mips64le"
+	case "riscv64":
+		return "riscv64"
+	case "ppc64le":
+		return "ppc64le"
+	case "s390x":
+		return "s390x"
+	case "loongarch64":
+		return "loong64"
 	default:
 		return uname
+	}
+}
+
+// normalizeOS maps uname -s output to Go GOOS values.
+func normalizeOS(uname string) string {
+	s := strings.ToLower(uname)
+	switch {
+	case s == "linux":
+		return "linux"
+	case s == "darwin":
+		return "darwin"
+	case strings.Contains(s, "freebsd"):
+		return "freebsd"
+	case strings.Contains(s, "openbsd"):
+		return "openbsd"
+	case strings.Contains(s, "netbsd"):
+		return "netbsd"
+	default:
+		return s
 	}
 }
 
@@ -508,6 +665,31 @@ rm -f "$0"
 	f.Close()
 	os.Chmod(f.Name(), 0700)
 	return f.Name(), nil
+}
+
+// progressReader wraps an io.Reader and prints a progress bar to stderr.
+type progressReader struct {
+	r     io.Reader
+	total int64
+	read  int64
+	last  int // last percentage printed
+}
+
+func (pr *progressReader) Read(p []byte) (int, error) {
+	n, err := pr.r.Read(p)
+	if n > 0 {
+		pr.read += int64(n)
+		pct := int(pr.read * 100 / pr.total)
+		if pct != pr.last {
+			pr.last = pct
+			bars := pct / 2 // 50 chars wide
+			fmt.Fprintf(os.Stderr, "\r[rssh] uploading [%-50s] %3d%%", strings.Repeat("#", bars), pct)
+			if pct == 100 {
+				fmt.Fprintln(os.Stderr)
+			}
+		}
+	}
+	return n, err
 }
 
 func execSSH(args []string) error {

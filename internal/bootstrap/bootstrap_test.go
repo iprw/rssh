@@ -1,7 +1,13 @@
 package bootstrap
 
 import (
+	"fmt"
 	"net"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -211,4 +217,242 @@ func TestFallbackMessageString(t *testing.T) {
 	// expected string fragment exists in the package by checking it via a
 	// compile-time reference embedded in this file.
 	_ = want // ensures the expected string is auditable here
+}
+
+func TestNormalizeArch(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"x86_64", "amd64"},
+		{"aarch64", "arm64"},
+		{"arm64", "arm64"},
+		{"i686", "386"},
+		{"i386", "386"},
+		{"armv7l", "arm"},
+		{"armv6l", "arm"},
+		{"mips", "mips"},
+		{"mipsel", "mipsle"},
+		{"mips64", "mips64"},
+		{"mips64el", "mips64le"},
+		{"riscv64", "riscv64"},
+		{"ppc64le", "ppc64le"},
+		{"s390x", "s390x"},
+		{"loongarch64", "loong64"},
+		{"unknown", "unknown"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got := normalizeArch(tt.input)
+			if got != tt.want {
+				t.Errorf("normalizeArch(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestNormalizeOS(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"Linux", "linux"},
+		{"Darwin", "darwin"},
+		{"FreeBSD", "freebsd"},
+		{"OpenBSD", "openbsd"},
+		{"NetBSD", "netbsd"},
+		{"SomeOS", "someos"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got := normalizeOS(tt.input)
+			if got != tt.want {
+				t.Errorf("normalizeOS(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestFindRelayBinary_SameArch(t *testing.T) {
+	path, cleanup, err := findRelayBinary(runtime.GOOS, runtime.GOARCH)
+	if err != nil {
+		t.Fatalf("findRelayBinary(same arch) error: %v", err)
+	}
+	if cleanup != nil {
+		defer cleanup()
+	}
+	if path == "" {
+		t.Fatal("expected non-empty path for same-arch binary")
+	}
+	// Should return the running executable.
+	self, _ := os.Executable()
+	if path != self {
+		t.Errorf("expected %q, got %q", self, path)
+	}
+}
+
+func TestFindRelayBinary_LocalLookup(t *testing.T) {
+	// Create a temp dir with a fake binary and point the search there.
+	tmpDir := t.TempDir()
+	fakeBin := filepath.Join(tmpDir, "rssh-fakeos-fakearch")
+	if err := os.WriteFile(fakeBin, []byte("#!/bin/sh\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Override os.Executable to return something in tmpDir so the search
+	// finds it next to the "executable".
+	fakeExe := filepath.Join(tmpDir, "rssh")
+	os.WriteFile(fakeExe, []byte("#!/bin/sh\n"), 0755)
+
+	// We can't easily override os.Executable, but we can place the binary
+	// in dist/ relative to cwd.
+	distDir := filepath.Join(tmpDir, "dist")
+	os.MkdirAll(distDir, 0755)
+	distBin := filepath.Join(distDir, "rssh-testdist-testarc")
+	os.WriteFile(distBin, []byte("#!/bin/sh\n"), 0755)
+
+	// Save and change cwd.
+	origDir, _ := os.Getwd()
+	os.Chdir(tmpDir)
+	defer os.Chdir(origDir)
+
+	path, cleanup, err := findRelayBinary("testdist", "testarc")
+	if err != nil {
+		t.Fatalf("findRelayBinary(local lookup) error: %v", err)
+	}
+	if cleanup != nil {
+		defer cleanup()
+	}
+	// dist is searched as a relative path, so resolve both for comparison.
+	wantAbs, _ := filepath.Abs(distBin)
+	gotAbs, _ := filepath.Abs(path)
+	if gotAbs != wantAbs {
+		t.Errorf("expected %q, got %q", wantAbs, gotAbs)
+	}
+}
+
+func TestFindRelayBinary_CacheLookup(t *testing.T) {
+	// Place a binary in ~/.rssh/bin/ and verify it's found.
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Skip("no home dir")
+	}
+	cacheDir := filepath.Join(home, ".rssh", "bin")
+	os.MkdirAll(cacheDir, 0755)
+
+	binaryName := "rssh-testcacheos-testcachearch"
+	cacheBin := filepath.Join(cacheDir, binaryName)
+	os.WriteFile(cacheBin, []byte("#!/bin/sh\n"), 0755)
+	defer os.Remove(cacheBin)
+
+	path, cleanup, err := findRelayBinary("testcacheos", "testcachearch")
+	if err != nil {
+		t.Fatalf("findRelayBinary(cache lookup) error: %v", err)
+	}
+	if cleanup != nil {
+		defer cleanup()
+	}
+	if path != cacheBin {
+		t.Errorf("expected %q, got %q", cacheBin, path)
+	}
+}
+
+func TestFindRelayBinary_Download(t *testing.T) {
+	// Spin up a test HTTP server that serves a fake binary.
+	fakeBinary := []byte("fake-rssh-binary-content")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/rssh-downloados-downloadarch" {
+			w.Write(fakeBinary)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	// Override the release URL to point to our test server.
+	origURL := releaseURL
+	releaseURL = srv.URL
+	defer func() { releaseURL = origURL }()
+
+	// Ensure no cached copy exists.
+	home, _ := os.UserHomeDir()
+	cachePath := filepath.Join(home, ".rssh", "bin", "rssh-downloados-downloadarch")
+	os.Remove(cachePath)
+	defer os.Remove(cachePath)
+
+	path, cleanup, err := findRelayBinary("downloados", "downloadarch")
+	if err != nil {
+		t.Fatalf("findRelayBinary(download) error: %v", err)
+	}
+	if cleanup != nil {
+		defer cleanup()
+	}
+	if path != cachePath {
+		t.Errorf("expected cached path %q, got %q", cachePath, path)
+	}
+
+	// Verify the content was written.
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read cached binary: %v", err)
+	}
+	if string(data) != string(fakeBinary) {
+		t.Errorf("cached binary content mismatch")
+	}
+}
+
+func TestFindRelayBinary_DownloadFail(t *testing.T) {
+	// Test server that returns 404.
+	srv := httptest.NewServer(http.NotFoundHandler())
+	defer srv.Close()
+
+	origURL := releaseURL
+	releaseURL = srv.URL
+	defer func() { releaseURL = origURL }()
+
+	// Ensure no cached copy.
+	home, _ := os.UserHomeDir()
+	os.Remove(filepath.Join(home, ".rssh", "bin", "rssh-noos-noarch"))
+
+	_, _, err := findRelayBinary("noos", "noarch")
+	if err == nil {
+		t.Fatal("expected error when download fails")
+	}
+	// Should contain helpful instructions.
+	errMsg := err.Error()
+	for _, want := range []string{"~/.rssh/bin/", "go build", "GOOS=noos", "GOARCH=noarch"} {
+		if !strings.Contains(errMsg, want) {
+			t.Errorf("error message missing %q: %s", want, errMsg)
+		}
+	}
+}
+
+func TestDownloadRelayBinary_AtomicWrite(t *testing.T) {
+	content := []byte("binary-payload")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(content)
+	}))
+	defer srv.Close()
+
+	origURL := releaseURL
+	releaseURL = srv.URL
+	defer func() { releaseURL = origURL }()
+
+	home, _ := os.UserHomeDir()
+	name := fmt.Sprintf("rssh-atomictest-%d", os.Getpid())
+	defer os.Remove(filepath.Join(home, ".rssh", "bin", name))
+
+	path, err := downloadRelayBinary(name)
+	if err != nil {
+		t.Fatalf("downloadRelayBinary error: %v", err)
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	// Should be executable.
+	if info.Mode()&0111 == 0 {
+		t.Error("downloaded binary is not executable")
+	}
 }

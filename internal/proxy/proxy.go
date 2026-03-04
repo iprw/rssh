@@ -45,9 +45,9 @@ func Run(ctx context.Context, cfg Config, stdin io.Reader, stdout io.Writer) err
 	if cfg.BufSize <= 0 {
 		cfg.BufSize = 4 * 1024 * 1024
 	}
-	if cfg.ReconnectTimeout <= 0 {
-		cfg.ReconnectTimeout = 30 * time.Second
-	}
+	// ReconnectTimeout <= 0 means retry forever (no deadline).
+	// The proxy keeps retrying with exponential backoff until
+	// the context is cancelled (user hits Ctrl-C).
 
 	// vlogf prints only when verbose is enabled.
 	vlogf := func(format string, args ...any) {
@@ -62,7 +62,7 @@ func Run(ctx context.Context, cfg Config, stdin io.Reader, stdout io.Writer) err
 		if cfg.TLSConfig == nil {
 			return fmt.Errorf("--h3 requires TLS")
 		}
-		h3Client = buildH3Client(cfg.TLSConfig)
+		h3Client = buildH3Client(cfg.TLSConfig, vlogf)
 		// Quick UDP preflight: verify we can send a UDP packet at all.
 		if host := extractHost(cfg.URL); host != "" {
 			if err := probeUDP(host); err != nil {
@@ -77,7 +77,7 @@ func Run(ctx context.Context, cfg Config, stdin io.Reader, stdout io.Writer) err
 	default: // auto: build both, race
 		h2Client = buildHTTPClient(cfg)
 		if cfg.TLSConfig != nil && cfg.SOCKSAddr == "" && cfg.HTTPClient == nil {
-			h3Client = buildH3Client(cfg.TLSConfig)
+			h3Client = buildH3Client(cfg.TLSConfig, vlogf)
 		}
 	}
 
@@ -214,12 +214,16 @@ func Run(ctx context.Context, cfg Config, stdin io.Reader, stdout io.Writer) err
 		}
 
 		if err != nil {
-			// Dial failed — start or continue the reconnect window.
-			if deadline.IsZero() {
-				deadline = time.Now().Add(cfg.ReconnectTimeout)
-			}
-			if time.Now().After(deadline) {
-				return fmt.Errorf("reconnect timeout after %v: %w", cfg.ReconnectTimeout, err)
+			// Dial failed — retry with exponential backoff. If a finite
+			// ReconnectTimeout is set, give up after that duration;
+			// otherwise retry forever until the context is cancelled.
+			if cfg.ReconnectTimeout > 0 {
+				if deadline.IsZero() {
+					deadline = time.Now().Add(cfg.ReconnectTimeout)
+				}
+				if time.Now().After(deadline) {
+					return fmt.Errorf("reconnect timeout after %v: %w", cfg.ReconnectTimeout, err)
+				}
 			}
 
 			logf("dial failed (%v), retrying in %v...", err, delay)
@@ -339,7 +343,9 @@ func Run(ctx context.Context, cfg Config, stdin io.Reader, stdout io.Writer) err
 			return ctx.Err()
 		}
 
-		deadline = time.Now().Add(cfg.ReconnectTimeout)
+		if cfg.ReconnectTimeout > 0 {
+			deadline = time.Now().Add(cfg.ReconnectTimeout)
+		}
 		delay = 100 * time.Millisecond
 		logf("connection lost, reconnecting...")
 	}
@@ -517,7 +523,9 @@ func buildHTTPClient(cfg Config) *http.Client {
 }
 
 // buildH3Client creates an HTTP/3 (QUIC) client for the given TLS config.
-func buildH3Client(tlsCfg *tls.Config) *http.Client {
+// vlogf is used for diagnostic messages so they only appear in verbose mode;
+// connection errors are suppressed when the other protocol succeeds.
+func buildH3Client(tlsCfg *tls.Config, vlogf func(string, ...any)) *http.Client {
 	// Clone and set ALPN to "h3" — QUIC requires explicit protocol negotiation.
 	h3TLS := tlsCfg.Clone()
 	h3TLS.NextProtos = []string{"h3"}
@@ -525,10 +533,10 @@ func buildH3Client(tlsCfg *tls.Config) *http.Client {
 	// Bind explicitly to IPv4 to avoid dual-stack routing issues.
 	udpConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
 	if err != nil {
-		logf("H3: failed to create UDP socket: %v", err)
+		vlogf("H3: failed to create UDP socket: %v", err)
 		return nil
 	}
-	logf("H3: UDP socket bound to %s", udpConn.LocalAddr())
+	vlogf("H3: UDP socket bound to %s", udpConn.LocalAddr())
 
 	qTransport := &quic.Transport{Conn: udpConn}
 
@@ -543,16 +551,16 @@ func buildH3Client(tlsCfg *tls.Config) *http.Client {
 			Dial: func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
 				udpAddr, err := net.ResolveUDPAddr("udp4", addr)
 				if err != nil {
-					logf("H3: resolve %q failed: %v", addr, err)
+					vlogf("H3: resolve %q failed: %v", addr, err)
 					return nil, fmt.Errorf("resolve udp4 %s: %w", addr, err)
 				}
-				logf("H3: QUIC dialing %s from %s", udpAddr, udpConn.LocalAddr())
+				vlogf("H3: QUIC dialing %s from %s", udpAddr, udpConn.LocalAddr())
 				conn, dialErr := qTransport.DialEarly(ctx, udpAddr, tlsCfg, cfg)
 				if dialErr != nil {
-					logf("H3: QUIC dial failed: %v", dialErr)
+					vlogf("H3: QUIC dial failed: %v", dialErr)
 					return nil, dialErr
 				}
-				logf("H3: QUIC connected to %s", udpAddr)
+				vlogf("H3: QUIC connected to %s", udpAddr)
 				return conn, nil
 			},
 		},

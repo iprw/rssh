@@ -127,7 +127,7 @@ func runRelay(args []string) {
 	listen := fs.String("listen", ":0", "listen address")
 	noTLS := fs.Bool("no-tls", false, "disable TLS")
 	sshdAddr := fs.String("sshd", "127.0.0.1:23", "sshd address to connect to")
-	idleTimeout := fs.Duration("idle-timeout", 60*time.Second, "shut down after this long with no client")
+	idleTimeout := fs.Duration("idle-timeout", 10*time.Minute, "shut down after this long with no client")
 	fs.Parse(args)
 
 	if *tok == "" {

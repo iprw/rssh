@@ -60,7 +60,7 @@ func New(cfg Config) *Relay {
 		cfg.BufSize = 4 * 1024 * 1024 // 4MB default
 	}
 	if cfg.IdleTimeout <= 0 {
-		cfg.IdleTimeout = 60 * time.Second
+		cfg.IdleTimeout = 10 * time.Minute
 	}
 	r := &Relay{
 		cfg:             cfg,
@@ -90,16 +90,16 @@ func (r *Relay) watchIdle() {
 	for {
 		select {
 		case <-r.clientConnected:
-			// Client connected — stop the idle timer.
+			// First client connected — disable the idle timer permanently.
+			// The relay stays alive as long as sshd is alive, allowing
+			// the client to reconnect after arbitrarily long outages.
 			if !timer.Stop() {
 				select {
 				case <-timer.C:
 				default:
 				}
 			}
-		case <-r.clientDone:
-			// Client disconnected — restart the idle timer.
-			timer.Reset(r.cfg.IdleTimeout)
+			return
 		case <-timer.C:
 			log.Printf("[relay] idle timeout (%v with no client), shutting down", r.cfg.IdleTimeout)
 			close(r.idle)
