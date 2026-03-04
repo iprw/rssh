@@ -64,4 +64,6 @@ release:
   github:
     owner: iprw
     name: rssh
-  generate_release_notes: true
+
+changelog:
+  use: github-native
