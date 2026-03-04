@@ -1,163 +1,114 @@
 # rssh
 
-`rssh` wraps `ssh` and tunnels your connection through a persistent HTTP/2 or QUIC relay on the remote host. When the network drops — Wi-Fi roaming, VPN reconnects, laptop sleep — the relay keeps your session alive and replays missed bytes on reconnect. No configuration, no server setup, no tmux.
+SSH that survives network interruptions. `rssh` wraps `ssh` with a small HTTP relay on the remote host — when your connection drops, the session stays alive and resumes transparently.
 
-## How it works
-
-```
-laptop                          server
-  |                               |
-  |  ssh + ProxyCommand           |
-  |  =========================>   |
-  |    HTTP/2 or HTTP/3 (QUIC)    |
-  |    through relay process      |
-  |  =========================>   |
-  |                            [relay]
-  |                               |
-  |                            [sshd]
-```
-
-1. **Bootstrap**: `rssh` SSHs into the server, deploys a small relay binary, and starts it
-2. **Tunnel**: The relay listens on an ephemeral HTTPS port. `rssh` reconnects SSH through it using `ProxyCommand`
-3. **Reconnect**: If the network drops, the relay stays alive on the server. `rssh` reconnects transparently — the SSH session never dies
-
-All data is buffered in ring buffers on both sides. On reconnect, missed bytes are replayed so nothing is lost.
-
-## Features
-
-- **Transparent reconnection** — survive Wi-Fi switches, VPN drops, laptop sleep
-- **HTTP/2 + HTTP/3 (QUIC) racing** — both protocols are tried in parallel, fastest wins
-- **Dedicated input connection** — keystrokes travel on a separate TCP stream, never blocked by heavy output
-- **Auto-deploy** — relay binary is deployed and updated automatically via SSH
-- **Auto-update** — relay is re-deployed when local binary changes (SHA256 hash check)
-- **Idle timeout** — relay shuts down after 60s with no client (no zombies)
-- **Tor support** — built-in SOCKS5 connector for routing through Tor
-- **Password forwarding** — `--pass` flag with self-cleaning askpass scripts
-- **Tiny binary** — ~3MB with UPX compression
-
-## Why not mosh?
-
-[mosh](https://mosh.org) solves a similar problem but takes a fundamentally different approach — it replaces SSH's transport entirely with its own UDP protocol and rebuilds your terminal state using SSP (State Synchronization Protocol). This means mosh can't forward ports, doesn't support scrollback, breaks tools that expect a real SSH connection, and needs its own server daemon installed and firewalled open.
-
-`rssh` takes the opposite approach: it keeps real SSH underneath. Your connection is still a genuine `ssh` process with all its features — port forwarding, agent forwarding, `~.` escapes, ProxyJump, config files, everything. The relay just makes the underlying TCP transport resilient. If the relay fails to start, `rssh` falls back to plain SSH automatically.
-
-| | rssh | mosh |
-|---|---|---|
-| Transport | Real SSH (wrapped) | Custom UDP protocol |
-| Port forwarding | Yes (native SSH) | No |
-| Scrollback | Yes | No |
-| Server install | Auto-deployed | Manual (package manager) |
-| Firewall | HTTPS (443-like) | UDP 60000-61000 |
-| Protocol | HTTP/2 + QUIC | SSP over UDP |
+No server setup, no configuration files, no tmux.
 
 ## Install
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/iprw/rssh/main/install.sh | sh
+```
+
+Or with a custom path:
+
+```sh
+INSTALL_DIR=~/.local/bin curl -fsSL https://raw.githubusercontent.com/iprw/rssh/main/install.sh | sh
+```
+
+Or from source (requires Go 1.26+):
 
 ```sh
 go install github.com/iprw/rssh/cmd/rssh@latest
 ```
 
-Or build from source:
-
-```sh
-git clone https://github.com/iprw/rssh
-cd rssh
-make build
-```
-
-Requires Go 1.25+. Optional: [UPX](https://upx.github.io/) for binary compression.
-
 ## Usage
 
 ```sh
-# Basic usage (same flags as ssh)
-rssh user@host
-
-# With password
-rssh --pass mypassword user@host
-
-# Force HTTP/3 (QUIC) only
-rssh --h3 user@host
-
-# Force HTTP/2 only
-rssh --h2 user@host
-
-# Route through Tor
-rssh --tor user@host
-
-# Custom Tor SOCKS proxy
-rssh --tor --tor-proxy 127.0.0.1:9150 user@host
-
-# Verbose output (rssh debug info)
-rssh -v user@host
-
-# Extra verbose (rssh + ssh debug)
-rssh -vv user@host
-
-# All standard ssh flags work
-rssh -p 2222 -i ~/.ssh/mykey -L 8080:localhost:80 user@host
-
-# Run a remote command
-rssh user@host uptime
+rssh user@host                     # just like ssh
+rssh -p 2222 -i ~/.ssh/key host    # all ssh flags work
+rssh -L 8080:localhost:80 host     # port forwarding works
+rssh user@host uptime              # remote commands work
 ```
 
-## Subcommands
-
-| Command | Purpose |
-|---------|---------|
-| `rssh [flags] host` | Connect via tunnelled SSH |
-| `rssh proxy <url>` | ProxyCommand bridge (internal) |
-| `rssh relay [flags]` | Relay server (internal) |
-| `rssh connect --proxy <addr> <host> <port>` | SOCKS5 connector (internal) |
-
-## Architecture
+### Options
 
 ```
+--pass <pw>     SSH password (skips interactive prompt)
+--h2            force HTTP/2 only
+--h3            force HTTP/3 (QUIC) only
+--tor           route through Tor
+--tor-proxy     SOCKS5 address (default 127.0.0.1:9050)
+--no-tls        disable TLS
+-v              verbose (rssh only)
+-vv             verbose (rssh + ssh)
+```
+
+### Update
+
+```sh
+rssh update     # self-update to latest release
+rssh version    # print current version
+```
+
+## How it works
+
+```
+laptop                        server
+  |                             |
+  |  1. ssh in, deploy relay    |
+  |  ========================>  |
+  |                          [relay]
+  |  2. reconnect ssh through   |
+  |     HTTP/2 or QUIC relay    |
+  |  ========================>  |
+  |                          [sshd]
+```
+
+1. `rssh` SSHs into the server, copies a small relay binary to `~/.rssh/`, and starts it
+2. The relay opens an ephemeral HTTPS port. `rssh` reconnects SSH through it via `ProxyCommand`
+3. If the network drops, the relay keeps running. `rssh` reconnects and replays missed bytes from ring buffers on both sides
+
+The SSH session underneath is real — port forwarding, agent forwarding, `~.` escapes, ProxyJump, and `.ssh/config` all work normally. If the relay fails to start, `rssh` falls back to plain SSH.
+
+## vs mosh
+
+mosh replaces SSH's transport with a custom UDP protocol. This breaks port forwarding, scrollback, and tools that expect a real SSH connection.
+
+`rssh` keeps real SSH underneath and just makes the transport resilient.
+
+| | rssh | mosh |
+|---|---|---|
+| Port forwarding | yes | no |
+| Scrollback | yes | no |
+| Server install | automatic | manual |
+| Firewall | HTTPS port | UDP 60000-61000 |
+| Protocol | HTTP/2 + QUIC | SSP over UDP |
+
+## Cross-architecture deploy
+
+When the remote server has a different OS or architecture, `rssh` automatically downloads the correct binary from [GitHub Releases](https://github.com/iprw/rssh/releases) and caches it in `~/.rssh/bin/`. Supported targets:
+
+- Linux: amd64, arm64, armv7, armv6, 386, mips, riscv64, ppc64le, s390x, loong64
+- macOS: amd64, arm64
+- Windows: amd64, arm64, 386
+- Android: arm64, amd64
+- FreeBSD, OpenBSD, NetBSD: amd64, arm64
+
+You can also pre-place binaries at `~/.rssh/bin/rssh-linux-arm64` (etc.) for offline use.
+
+## Project layout
+
+```
+cmd/rssh/        main binary, subcommand dispatch
 internal/
-  bootstrap/   CLI entrypoint: arg parsing, relay deploy, SSH exec
-  proxy/       Client-side HTTP streaming bridge (stdin/stdout <-> relay)
-  relay/       Server-side HTTP handler (client <-> sshd)
-  ringbuf/     Ring buffer with offset tracking for reconnect replay
-  tlsutil/     Self-signed TLS cert generation and config
-  token/       Session token generation and validation
-cmd/rssh/      Main binary: subcommand dispatch
+  bootstrap/     CLI entrypoint, relay deploy, SSH exec
+  proxy/         client-side HTTP streaming bridge
+  relay/         server-side HTTP handler
+  ringbuf/       ring buffer with offset tracking
+  tlsutil/       self-signed TLS cert management
+  token/         session token generation
 ```
-
-### Data flow
-
-```
-stdin -> [proxy] --HTTP POST body--> [relay] --> [sshd]
-stdout <- [proxy] <-HTTP response--- [relay] <-- [sshd]
-```
-
-On reconnect, the client sends its `offset` (bytes already received). The relay replays everything after that offset from its ring buffer. The relay also reports its `inOffset` (bytes received from client) so the client can replay missed input.
-
-### Protocol selection
-
-| Mode | Transport | When |
-|------|-----------|------|
-| Auto (default) | H2 + H3 raced | Both tried in parallel, first success wins |
-| `--h2` | HTTP/2 over TLS | TCP only, works through all firewalls |
-| `--h3` | HTTP/3 over QUIC | UDP, lower latency, survives IP changes |
-
-H3 uses a dedicated `/input` endpoint for all client input (QUIC streams don't support full-duplex POST bodies). H2 uses bidirectional POST streaming with an optional dedicated input connection.
-
-## Cross-compilation
-
-```sh
-make release
-```
-
-Produces binaries in `dist/` for:
-- `linux/amd64`, `linux/arm64`
-- `darwin/amd64`, `darwin/arm64`
-
-## Testing
-
-```sh
-make test
-```
-
-Includes unit tests for all packages and an integration test that exercises the full relay pipeline.
 
 ## License
 
