@@ -50,7 +50,7 @@ builds:
         goarch: "386"
     hooks:
       post:
-        - cmd: upx --best --lzma "{{ .Path }}" || true
+        - cmd: sh -c 'upx --best --lzma "{{ .Path }}" || true'
 
 archives:
   - format: binary
